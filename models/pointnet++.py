@@ -11,11 +11,47 @@ import torchvision.transforms as transforms
 import torchvision.utils as vutils
 from torch.autograd import Variable
 import torch.nn.functional as F
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.nn import knn_graph, knn_interpolate
+from torch_scatter import scatter_add
 
 from pointnet import PointNetEncoder, TNet
 
 from utils_samplers import *
 
+class EdgeConv(nn.Module):
+    def __init__(self, in_channels, out_channels, k):
+        super(EdgeConv, self).__init__()
+        self.k = k
+        self.mlp = nn.Sequential(
+            nn.Linear(2 * in_channels, out_channels),
+            nn.ReLU(),
+            nn.Linear(out_channels, out_channels)
+        )
+
+    def forward(self, x, pos):
+        edge_index = knn_graph(pos, self.k, batch=None, loop=False)
+        edge_attr = x[edge_index[1]] - x[edge_index[0]]
+        x = self.mlp(torch.cat([x[edge_index[0]], edge_attr], dim=1))
+        x = scatter_add(x, edge_index[1], dim=0, dim_size=pos.size(0))
+        return x
+class EdgeBranch(nn.Module):
+    def __init__(self, num_features, k_values):
+        super(EdgeBranch, self).__init__()
+        self.edge_layers = nn.ModuleList()
+        in_channels = num_features
+
+        for k in k_values:
+            out_channels = in_channels * 2
+            self.edge_layers.append(EdgeConv(in_channels, out_channels, k))
+            in_channels = out_channels
+
+    def forward(self, x, pos):
+        for layer in self.edge_layers:
+            x = layer(x, pos)
+        return x
 
 class PointNetSetAbstraction(nn.Module):
     def __init__(self, npoint, radius, nsample, in_channel, mlp, group_all):
@@ -171,6 +207,7 @@ class PointNetPPEncoder(nn.Module):
             additional_channels += 3
         self.is_color = is_color
         self.is_normal = is_normal
+        self.edge_branch = EdgeBranch(3 + additional_channels, k_values)
         # Feature Extraction at Multiple Scales inside each set abstraction layer to get multi scale features
         self.sa1 = PointNetSetAbstractionMsg(
             1024, [0.05, 0.1], [16, 32], 3+additional_channels, [[16, 16, 32], [32, 32, 64]])
@@ -183,10 +220,15 @@ class PointNetPPEncoder(nn.Module):
 
     def forward(self, xyz):
         B, C, N = xyz.size()
-        # split the xyz coords from the color and normals
         if self.is_normal or self.is_color:
             l0_points = xyz
             l0_xyz = xyz[:, :3, :]
+
+        # Pass input data through EdgeBranch
+        edge_features = self.edge_branch(l0_xyz, l0_points)
+
+        # Combine the edge features with the input point features
+        l0_points = torch.cat([l0_points, edge_features], dim=1)
 
         # Now send the xyz and points through set abstraction layers
         l1_xyz, l1_points = self.sa1(l0_xyz, l0_points)
@@ -194,10 +236,7 @@ class PointNetPPEncoder(nn.Module):
         l3_xyz, l3_points = self.sa3(l2_xyz, l2_points)
         l4_xyz, l4_points = self.sa4(l3_xyz, l3_points)
 
-        # Now we have multi scale features at every layer of point cloud abstraction
-        # We can basically do anything with these learned features
         return l1_points, l2_points, l3_points, l4_points
-
 
 if __name__ == '__main__':
     import torch
